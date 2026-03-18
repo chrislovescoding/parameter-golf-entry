@@ -579,14 +579,12 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        # Manually repeat KV heads to match Q heads (compatible with all GPUs).
+        if self.num_kv_heads != self.num_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = k.unsqueeze(2).expand(bsz, self.num_kv_heads, n_rep, seqlen, self.head_dim).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+            v = v.unsqueeze(2).expand(bsz, self.num_kv_heads, n_rep, seqlen, self.head_dim).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -760,8 +758,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
