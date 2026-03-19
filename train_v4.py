@@ -1247,8 +1247,10 @@ def main() -> None:
     if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
+        # Use base_model (uncompiled) for sliding window since per_token=True
+        # triggers recompilation issues with fullgraph=True.
         sw_val_loss, sw_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps, val_tokens,
+            args, base_model, rank, world_size, device, grad_accum_steps, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
         )
