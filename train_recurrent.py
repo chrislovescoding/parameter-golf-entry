@@ -59,14 +59,14 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape — recurrent architecture.
-    # Config D: 6 blocks × 3 loops = 18 eff layers, dim=704, ~23.4M params, ~15.4MB artifact
+    # v1: 5 blocks × 3 loops = 15 eff layers, dim=640, ~16.6M params
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_blocks = int(os.environ.get("NUM_BLOCKS", 6))
+    num_blocks = int(os.environ.get("NUM_BLOCKS", 5))
     num_loops = int(os.environ.get("NUM_LOOPS", 3))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 704))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 1088))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
+    model_dim = int(os.environ.get("MODEL_DIM", 640))
+    num_heads = int(os.environ.get("NUM_HEADS", 10))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 1024))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -90,6 +90,14 @@ class Hyperparameters:
     # QAT: fake quantization with straight-through estimator.
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.5))
+
+    # Sliding window eval: stride < seq_len means overlapping windows.
+    # Only last `stride` tokens per window are scored, giving ~(seq_len-stride) context.
+    # stride=0 means no sliding window (original behavior).
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
+
+    # Keep embedding in fp16 during quantization (avoids int8 quality loss on embeddings).
+    embed_fp16 = bool(int(os.environ.get("EMBED_FP16", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -220,38 +228,65 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    stride: int = 0,
 ) -> tuple[float, float]:
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    """Evaluate on validation set. stride>0 enables sliding window (only final eval)."""
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    use_sliding = 0 < stride < seq_len
+    batch_seqs = max(1, args.val_batch_size // seq_len)
+
+    if use_sliding:
+        n_windows = (total_tokens - seq_len) // stride + 1
+        win_start = (n_windows * rank) // world_size
+        win_end = (n_windows * (rank + 1)) // world_size
+    else:
+        total_seqs = total_tokens // seq_len
+        win_start = (total_seqs * rank) // world_size
+        win_end = (total_seqs * (rank + 1)) // world_size
+        stride = seq_len  # score all tokens
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for wb in range(win_start, win_end, batch_seqs):
+            we = min(wb + batch_seqs, win_end)
+            bsz = we - wb
+            if use_sliding:
+                x = torch.stack([val_tokens[w * stride : w * stride + seq_len] for w in range(wb, we)])
+                y = torch.stack([val_tokens[w * stride + 1 : w * stride + seq_len + 1] for w in range(wb, we)])
+            else:
+                raw_start = wb * seq_len
+                raw_end = we * seq_len + 1
+                local = val_tokens[raw_start:raw_end]
+                x = local[:-1].reshape(-1, seq_len)
+                y = local[1:].reshape(-1, seq_len)
+            x = x.to(device=device, dtype=torch.int64, non_blocking=True)
+            y = y.to(device=device, dtype=torch.int64, non_blocking=True)
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
+                if use_sliding:
+                    per_token = model(x, y, per_token=True).detach()
+                    scored_loss = per_token[:, -stride:]
+                else:
+                    batch_loss = model(x, y).detach()
+
+            if use_sliding:
+                val_loss_sum += scored_loss.to(torch.float64).sum()
+                val_token_count += scored_loss.numel()
+                scored_x = x[:, -stride:]
+                scored_y = y[:, -stride:]
+            else:
+                val_loss_sum += batch_loss.to(torch.float64) * float(y.numel())
+                val_token_count += float(y.numel())
+                scored_x = x
+                scored_y = y
+
+            tgt_ids = scored_y.reshape(-1)
+            prev_ids = scored_x.reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
@@ -322,6 +357,8 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+EMBED_FP16_PATTERNS = ("tok_emb",) if Hyperparameters.embed_fp16 else ()
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -346,7 +383,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        # Keep embedding in fp16 if configured (avoids int8 quality loss).
+        if any(pat in name for pat in EMBED_FP16_PATTERNS) or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
@@ -694,14 +732,11 @@ class GPT(nn.Module):
             if isinstance(module, CastedLinear):
                 module.use_qat = False
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, per_token: bool = False) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # Depth recurrence: loop through all blocks num_loops times.
-        # Loop embeddings provide per-iteration identity so the model can
-        # differentiate between early and late passes.
         for loop_idx in range(self.num_loops):
             x = x + self.loop_embs[loop_idx].to(dtype=x.dtype)[None, None, :]
             for block in self.blocks:
@@ -716,6 +751,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if per_token:
+            return F.cross_entropy(logits.float(), targets, reduction="none").view(input_ids.shape)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1117,17 +1154,10 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
+    # Standard eval (fast, comparable to mid-training metrics).
     q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        args, model, rank, world_size, device, grad_accum_steps, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
@@ -1135,6 +1165,22 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Sliding window eval (slow, better BPB — the submission score).
+    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
